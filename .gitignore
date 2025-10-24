@@ -1,0 +1,11 @@
+# Ignore Excel files
+*.xlsx
+
+# Ignore CSV files
+*.csv
+
+# Ignore text files
+*.txt
+
+# Ignore JSON files
+*.json
