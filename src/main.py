@@ -16,6 +16,116 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+def generate_output_excel(tws, results):
+    # Example: write each folder’s per-file DataFrames to disk (one Excel workbook per folder)
+    # Each sheet is a file; DataFrame has a 'SourceFile' column for traceability.
+    import os
+    from pathlib import Path
+    import pandas as pd
+
+    # Styling imports
+    from openpyxl.styles import PatternFill
+    from openpyxl.utils import get_column_letter
+
+    # Columns to drop from AdLidPriceOnly
+    DROP_FROM_AD = ["Product Number", "Type", "Holiday Coloring Code", "Unnamed: 2", "Unnamed: 3"]
+
+    out_dir = Path("assets") / "summaries"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for folder_name, files_map in results.items():
+        if not files_map:
+            continue
+        safe_folder = folder_name.replace("/", "_")
+        out_path = out_dir / f"{safe_folder}.xlsx"
+
+        with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+            # Manifest (from inventory) for context
+            folder_files = tws.resolver.files_under_folder_name(folder_name)
+            folder_files.to_excel(xw, index=False, sheet_name="__manifest__")
+
+            # ---- WRITE EACH SHEET ----
+            for fname, df_file in files_map.items():
+                sheet = fname[:31] or "Sheet"  # Excel sheet name limit
+
+                # If this is the AdLidPriceOnly sheet, drop specified columns if present
+                df_to_write = df_file
+                if fname == "AdLidPriceOnly":
+                    df_to_write = df_file.drop(columns=DROP_FROM_AD, errors="ignore")
+
+                df_to_write.to_excel(xw, index=False, sheet_name=sheet)
+
+            # ---- AUTOFIT ALL SHEETS (openpyxl) ----
+            wb = xw.book
+            for ws in wb.worksheets:
+                # Determine max width per column using header values
+                widths = {}
+                # Include header row
+                for col_idx, cell in enumerate(ws[1], start=1):
+                    txt = str(cell.value) if cell.value is not None else ""
+                    widths[col_idx] = max(widths.get(col_idx, 0), len(txt))
+                # Include data rows (limit extremely long strings)
+                for row in ws.iter_rows(min_row=2):
+                    for col_idx, cell in enumerate(row, start=1):
+                        val = cell.value
+                        if val is None:
+                            ln = 0
+                        else:
+                            # Stringify with a reasonable cap to avoid huge widths
+                            s = str(val)
+                            if len(s) > 200:
+                                s = s[:200]
+                            ln = len(s)
+                        widths[col_idx] = max(widths.get(col_idx, 0), ln)
+                # Apply width with padding and a minimum
+                for col_idx, max_len in widths.items():
+                    col_letter = get_column_letter(col_idx)
+                    # Approximate width: characters + padding; clamp to sensible bounds
+                    adjusted = max(8, min(max_len + 2, 60))
+                    ws.column_dimensions[col_letter].width = adjusted
+
+            # ---- ALTERNATING HIGHLIGHT BY UNIQUE 'Item' GROUPS: ONLY for 'AdLidPriceOnly' ----
+            # Toggling fill whenever the 'Item' value changes from the previous row.
+            alt_fill_a = PatternFill(start_color="FFF2F2F2", end_color="FFF2F2F2", fill_type="solid")  # light gray
+            alt_fill_b = PatternFill(start_color="FFFFFFFF",  end_color="FFFFFFFF",  fill_type="solid")  # white
+
+            for ws in wb.worksheets:
+                if ws.title != "AdLidPriceOnly":
+                    continue  # apply styling only to AdLidPriceOnly
+
+                # Find the 'Item' column index by scanning the header row (row 1)
+                item_col_idx = None
+                for col_idx, cell in enumerate(ws[1], start=1):
+                    if str(cell.value).strip().lower() == "item":
+                        item_col_idx = col_idx
+                        break
+
+                if item_col_idx is None:
+                    # No 'Item' column -> nothing to group; leave as-is
+                    continue
+
+                # Walk data rows and toggle fill per contiguous Item groups
+                current_fill = alt_fill_a
+                previous_item = None
+
+                for r in range(2, ws.max_row + 1):
+                    item_val = ws.cell(row=r, column=item_col_idx).value
+
+                    if r == 2:
+                        # start first data group with alt_fill_a
+                        current_fill = alt_fill_a
+                    else:
+                        if item_val != previous_item:
+                            # New group -> toggle fill
+                            current_fill = alt_fill_b if current_fill == alt_fill_a else alt_fill_a
+
+                    # Apply fill to the entire row across existing columns
+                    for c in range(1, ws.max_column + 1):
+                        ws.cell(row=r, column=c).fill = current_fill
+
+                    previous_item = item_val
+
+    return out_dir
 
 def main():
     # 1) Load config and acquire token
@@ -49,38 +159,16 @@ def main():
     """,
     engine=engine)
     sundayweeknumber = int(time_df.loc[0, 'sundayweeknumber'])
-    print(sundayweeknumber)
 
     # Save to CSV for inspection
     df.to_csv("assets\\ad_lids_inventory.csv", index=False)
 
-
-    # ---- NEW: summarize 3 relevant folders ----
+    # Generate output excel file
     tws = ThreeWeekSummarizer(graph_client=gc, owner_upn=cfg.OWNER_UPN, inventory_df=df)
     results = tws.run(sundayweeknumber=sundayweeknumber, horizon=3)
-
-    # Example: write each folder’s per-file DataFrames to disk (one Excel workbook per folder)
-    # Each sheet is a file; DataFrame has a 'SourceFile' column for traceability.
-    import os
-    from pathlib import Path
-    import pandas as pd
-
-    out_dir = Path("assets") / "summaries"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for folder_name, files_map in results.items():
-        if not files_map:
-            continue
-        safe_folder = folder_name.replace("/", "_")
-        out_path = out_dir / f"{safe_folder}.xlsx"
-        with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-            # Manifest (from inventory) for context
-            folder_files = tws.resolver.files_under_folder_name(folder_name)
-            folder_files.to_excel(xw, index=False, sheet_name="__manifest__")
-
-            for fname, df_file in files_map.items():
-                sheet = fname[:31] or "Sheet"  # Excel sheet name limit
-                df_file.to_excel(xw, index=False, sheet_name=sheet)
+    
+    results_consolidated = tws.summarize_books(results)
+    out_dir = generate_output_excel(tws=tws, results=results_consolidated)
 
     logger.info("Summaries written to: %s", out_dir.resolve())
 

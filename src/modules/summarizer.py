@@ -4,9 +4,11 @@ from __future__ import annotations
 import io
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Mapping
 
+import numpy as np
 import pandas as pd
+import re
 
 from modules.graph_client import GraphClient
 
@@ -91,7 +93,7 @@ class FolderSummarizer:
     ):
         self.gc = graph_client
         self.owner_upn = owner_upn
-        self.file_parser = file_parser or self._default_excel_first_sheet
+        self.file_parser = file_parser or self._excel_all_sheets_concat
 
     # ---------- public API ----------
 
@@ -130,21 +132,45 @@ class FolderSummarizer:
 
         return outputs
 
-    # ---------- default parser (first sheet) ----------
-
+    # ---------- default parser (all sheets) ----------
     @staticmethod
-    def _default_excel_first_sheet(content: bytes, file_name: str) -> pd.DataFrame:
+    def _excel_all_sheets_concat(content: bytes, file_name: str) -> pd.DataFrame:
         """
-        Loads the first sheet of an Excel file as a DataFrame.
-        Adds a 'SourceFile' column to help with downstream merges.
+        Loads *all* sheets of an Excel file and concatenates them into a single DataFrame.
+        Adds 'SourceFile' and 'SheetName' columns for traceability.
         """
         bio = io.BytesIO(content)
-        # pandas will infer engine openpyxl for .xlsx at runtime in your environment
-        # If a file has no sheets or is empty, pandas will raise; caller handles exceptions.
-        df_first = pd.read_excel(bio, sheet_name=0, engine="openpyxl")
-        df_first.insert(0, "SourceFile", file_name)
-        return df_first
+        sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
 
+        frames = []
+        for sheet_name, df in sheets.items():
+            # 1) Skip truly empty DataFrames (0 rows, 0 cols)
+            if df is None or (hasattr(df, "empty") and df.empty and df.shape[1] == 0):
+                continue
+
+            # 2) Drop columns that are entirely NA to avoid the concat FutureWarning
+            base = df.copy()
+            base = base.dropna(axis=1, how="all")
+
+            # 3) If after dropping all-NA columns the sheet has no informative content, skip it
+            if base.shape[1] == 0 or not base.notna().any().any():
+                continue
+
+            # 4) Add provenance columns last (so they don't affect the NA checks)
+            base.insert(0, "SheetName", str(sheet_name))
+            base.insert(0, "SourceFile", file_name)
+
+            frames.append(base)
+
+        if not frames:
+            # Create a minimal marker row so caller doesn’t fail on empty workbook
+            return pd.DataFrame([{
+                "SourceFile": file_name,
+                "SheetName": "(empty workbook)"
+            }])
+
+        # Concatenate without the all-NA columns/frames included above
+        return pd.concat(frames, ignore_index=True)
 
 class ThreeWeekSummarizer:
     """
@@ -157,6 +183,64 @@ class ThreeWeekSummarizer:
         self.inventory_df = inventory_df.copy()
         self.resolver = WeekFolderResolver(self.inventory_df)
         self.folder_summarizer = FolderSummarizer(self.gc, self.owner_upn)
+
+    def _parse_dates_explicit(self, series_obj: pd.Series) -> pd.Series:
+        """
+        Return a boolean mask (index-aligned) indicating which entries have
+        MORE THAN 7 characters AFTER removing all non-number characters
+        (except for periods) from the series.
+
+        Examples before length check:
+        "2025-10-18 00:00:00" -> "20251018000000"
+        "$     34.95"         -> "34.95"
+        "13.5"                -> "13.5"
+        """
+        s = series_obj.astype("object")
+
+        # Normalize everything to string; treat NaN/None as empty
+        def _to_str(v):
+            if v is None:
+                return ""
+            # Keep numeric representations (e.g., 13.5) as strings
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                # Convert NaN to empty
+                if isinstance(v, float) and np.isnan(v):
+                    return ""
+                return str(v)
+            return str(v)
+
+        as_str = s.apply(_to_str)
+
+        # Remove all non-number characters except periods
+        cleaned = as_str.str.replace(r"[^0-9.]", "", regex=True)
+
+        # Length > 7 indicates "date-like" per your new heuristic
+        mask = cleaned.str.len() > 7
+
+        # Ensure boolean Series aligned to original index
+        return mask.fillna(False)
+
+    def _clean_ad_lid_price(self, series: pd.Series) -> pd.Series:
+        s = series.copy()
+
+        # Normalize whitespace on strings
+        def _strip_if_str(v):
+            return v.strip() if isinstance(v, str) else v
+        s = s.map(_strip_if_str)
+
+        # If native datetime dtype, they are all dates (treat as missing for price)
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return pd.Series([np.nan] * len(s), index=s.index)
+
+        s_obj = s.astype("object")
+
+        # Use explicit-format parser (no inference -> no warning)
+        is_date_like = self._parse_dates_explicit(s_obj)
+
+        cleaned = s_obj.mask(is_date_like, other=np.nan)
+        cleaned = cleaned.replace("", np.nan)
+
+        return cleaned
 
     def run(self, sundayweeknumber: int, horizon: int = 3) -> Dict[str, Dict[str, pd.DataFrame]]:
         """
@@ -183,3 +267,101 @@ class ThreeWeekSummarizer:
             results[fi.name] = per_file
 
         return results
+
+
+
+    def summarize_books(
+        self,
+        results: "Mapping[str, Mapping[str, pd.DataFrame]]",
+        *,
+        how: str = "union",
+        add_folder_col: bool = True,
+        add_ad_lid_price_only_sheet: bool = True,   # NEW: toggle the second worksheet
+        ad_lid_price_col: str = "Ad Lid Price"      # Column name to inspect/clean
+    ) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """
+        Consolidate each folder's per-file DataFrames into one consolidated DataFrame,
+        and (optionally) add a second DataFrame with only rows having a non-empty, non-date
+        Ad Lid Price value after cleaning.
+
+        Returns:
+            {
+              folder_name: {
+                  "Consolidated": DataFrame,
+                  "AdLidPriceOnly": DataFrame   # included if add_ad_lid_price_only_sheet
+              }
+            }
+        """
+        out: Dict[str, Dict[str, pd.DataFrame]] = {}
+
+        for folder_name, files_map in results.items():
+            if not files_map:
+                out[folder_name] = {}
+                continue
+            frames: List[pd.DataFrame] = []
+            for file_name, df in files_map.items():
+                if df is None:
+                    continue
+                d = df.copy()
+
+                # Ensure provenance columns exist
+                if "SourceFile" not in d.columns:
+                    d.insert(0, "SourceFile", file_name)
+                if "SheetName" not in d.columns:
+                    d.insert(1, "SheetName", "(unknown)")
+                if add_folder_col and "Folder" not in d.columns:
+                    d.insert(0, "Folder", folder_name)
+
+                # Drop all-NA columns (prevents concat FutureWarning and keeps things tidy)
+                d = d.dropna(axis=1, how="all")
+
+                frames.append(d)
+
+            if not frames:
+                out[folder_name] = {}
+                continue
+
+            # Combine frames
+            if how == "intersection":
+                common = set(frames[0].columns)
+                for f in frames[1:]:
+                    common &= set(f.columns)
+                cols = [c for c in frames[0].columns if c in common]
+                frames = [f[cols] for f in frames]
+                combined = pd.concat(frames, ignore_index=True)
+            else:
+                combined = pd.concat(frames, ignore_index=True)
+
+            # Always keep a consolidated sheet
+            out[folder_name] = {"Consolidated": combined}
+
+            # Optionally add AdLidPriceOnly sheet
+            if add_ad_lid_price_only_sheet:
+                if ad_lid_price_col in combined.columns:
+                    cleaned = self._clean_ad_lid_price(combined[ad_lid_price_col])
+                    mask = cleaned.notna()
+                    # Choose the same columns as consolidated; add a cleaned helper col for auditing
+                    ad_only = combined.loc[mask].copy()
+                    ad_only[ad_lid_price_col] = cleaned.loc[mask]
+
+                    # ---------------------------- NEW: sort AdLidPriceOnly by Item numerically ----------------------------
+                    if "Item" in ad_only.columns:
+                        ad_only = ad_only.sort_values(
+                            by="Item",
+                            key=lambda s: pd.to_numeric(
+                                s.astype(str).str.strip().str.replace(r"[^0-9.\-]", "", regex=True),
+                                errors="coerce"
+                            ),
+                            ascending=True,
+                            na_position="last"
+                        ).reset_index(drop=True)
+                    # ------------------------------------------------------------------------------------------------------
+
+                    # You could also keep the original in a separate column for comparison:
+                    # ad_only["Ad Lid Price (raw)"] = combined[ad_lid_price_col].loc[mask]
+                    out[folder_name]["AdLidPriceOnly"] = ad_only
+                else:
+                    # Column missing: create an empty sheet with just provenance for clarity
+                    out[folder_name]["AdLidPriceOnly"] = combined.head(0).copy()
+
+        return out
