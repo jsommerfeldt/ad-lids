@@ -51,6 +51,16 @@ class GraphClient:
         self._raise_for_status(resp)
         return resp.content
 
+    def download_item_content_by_user_item(self, upn: str, item_id: str) -> bytes:
+        """
+        Download a file for a given user using only the item id.
+        GET /users/{upn}/drive/items/{item-id}/content
+        """
+        url = f"{self.base}/users/{upn}/drive/items/{item_id}/content"
+        resp = self.session.get(url, timeout=180)
+        self._raise_for_status(resp)
+        return resp.content
+    
     @staticmethod
     def _raise_for_status(resp: requests.Response):
         try:
@@ -61,3 +71,4 @@ class GraphClient:
             except Exception:
                 detail = resp.text
             raise requests.HTTPError(f"{e}\nResponse detail: {detail}") from None
+
