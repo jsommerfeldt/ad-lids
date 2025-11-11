@@ -52,9 +52,17 @@ def generate_output_excel(tws, results):
                 df_to_write = df_file
                 if fname == "AdLidPriceOnly":
                     df_to_write = df_file.drop(columns=DROP_FROM_AD, errors="ignore")
+                
+                # Resort columns
+                resort_order = [
+                    'Loading Start Date', 'Loading End Date', 'Commodity', 'Vendor', 'Item', 'Description','Ad Lid Price',
+                    'FOB or Delivered', 'Confirm by Date', 'Country of Origin', 'Loading Location', 'Estimated Quantity Needed',
+                    'Notes', 'Folder', 'SourceFile', 'SheetName']
+                df_to_write = df_to_write[resort_order]
 
                 df_to_write.to_excel(xw, index=False, sheet_name=sheet)
 
+            """ OLD
             # ---- AUTOFIT ALL SHEETS (openpyxl) ----
             wb = xw.book
             for ws in wb.worksheets:
@@ -83,6 +91,54 @@ def generate_output_excel(tws, results):
                     # Approximate width: characters + padding; clamp to sensible bounds
                     adjusted = max(8, min(max_len + 2, 60))
                     ws.column_dimensions[col_letter].width = adjusted
+            """
+
+            # ---- AUTOFIT ALL SHEETS (openpyxl) ----
+            wb = xw.book
+            # Columns that should NOT be autofitted
+            SKIP_AUTOFIT_COLS = {"Folder", "SourceFile", "SheetName"}
+
+            for ws in wb.worksheets:
+                # Build a header map: col_idx -> header_text
+                header_map = {}
+                for col_idx, cell in enumerate(ws[1], start=1):
+                    hdr = "" if cell.value is None else str(cell.value).strip()
+                    header_map[col_idx] = hdr
+
+                # Determine max width per column using header values, but skip specified columns
+                widths = {}
+                # Include header row
+                for col_idx, cell in enumerate(ws[1], start=1):
+                    hdr = header_map.get(col_idx, "")
+                    if hdr in SKIP_AUTOFIT_COLS:
+                        continue  # block autofitting for these columns
+                    txt = str(cell.value) if cell.value is not None else ""
+                    widths[col_idx] = max(widths.get(col_idx, 0), len(txt))
+
+                # Include data rows (limit extremely long strings)
+                for row in ws.iter_rows(min_row=2):
+                    for col_idx, cell in enumerate(row, start=1):
+                        hdr = header_map.get(col_idx, "")
+                        if hdr in SKIP_AUTOFIT_COLS:
+                            continue  # do not measure widths for these columns
+                        val = cell.value
+                        if val is None:
+                            ln = 0
+                        else:
+                            s = str(val)
+                            if len(s) > 200:
+                                s = s[:200]
+                            ln = len(s)
+                        widths[col_idx] = max(widths.get(col_idx, 0), ln)
+
+                # Apply width with padding and a minimum, skipping blocked columns
+                for col_idx, max_len in widths.items():
+                    hdr = header_map.get(col_idx, "")
+                    if hdr in SKIP_AUTOFIT_COLS:
+                        continue  # explicitly do not set width for these columns
+                    col_letter = get_column_letter(col_idx)
+                    adjusted = max(8, min(max_len + 2, 60))
+                    ws.column_dimensions[col_letter].width = adjusted
 
             # ---- ALTERNATING HIGHLIGHT BY UNIQUE 'Item' GROUPS: ONLY for 'AdLidPriceOnly' ----
             # Toggling fill whenever the 'Item' value changes from the previous row.
@@ -90,6 +146,7 @@ def generate_output_excel(tws, results):
             alt_fill_b = PatternFill(start_color="FFFFFFFF",  end_color="FFFFFFFF",  fill_type="solid")  # white
 
             for ws in wb.worksheets:
+
                 if ws.title != "AdLidPriceOnly":
                     continue  # apply styling only to AdLidPriceOnly
 
@@ -124,6 +181,11 @@ def generate_output_excel(tws, results):
                         ws.cell(row=r, column=c).fill = current_fill
 
                     previous_item = item_val
+
+            for ws in wb.worksheets:
+                # Hide irrelevant sheets
+                if ws.title in ('__manifest__', 'Consolidated'):
+                    ws.sheet_state = "hidden"
 
     return out_dir
 

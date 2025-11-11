@@ -184,16 +184,19 @@ class ThreeWeekSummarizer:
         self.resolver = WeekFolderResolver(self.inventory_df)
         self.folder_summarizer = FolderSummarizer(self.gc, self.owner_upn)
 
-    def _parse_dates_explicit(self, series_obj: pd.Series) -> pd.Series:
+    def _parse_dates_explicit(self, series_obj: pd.Series) -> tuple[pd.Series, pd.Series]:
         """
-        Return a boolean mask (index-aligned) indicating which entries have
-        MORE THAN 7 characters AFTER removing all non-number characters
-        (except for periods) from the series.
+        Return:
+        - mask: boolean Series (index-aligned) indicating which entries have
+            MORE THAN 7 characters AFTER removing all non-number characters
+            (except for periods) from the series.
+        - cleaned: string Series (index-aligned) of the normalized string where
+            all non-number characters except periods are removed.
 
         Examples before length check:
-        "2025-10-18 00:00:00" -> "20251018000000"
-        "$     34.95"         -> "34.95"
-        "13.5"                -> "13.5"
+        "2025-10-18 00:00:00" -> "20251018000000" (len 14) => date-like
+        "$     34.95"         -> "34.95"         (len 5)  => not date-like
+        "13.5"                -> "13.5"          (len 4)  => not date-like
         """
         s = series_obj.astype("object")
 
@@ -214,12 +217,16 @@ class ThreeWeekSummarizer:
         # Remove all non-number characters except periods
         cleaned = as_str.str.replace(r"[^0-9.]", "", regex=True)
 
-        # Length > 7 indicates "date-like" per your new heuristic
+        # Length > 7 indicates "date-like" per your heuristic
         mask = cleaned.str.len() > 7
 
-        # Ensure boolean Series aligned to original index
-        return mask.fillna(False)
+        # Ensure alignment & types
+        mask = mask.fillna(False)
+        cleaned = cleaned.fillna("")
 
+        # Return BOTH the boolean mask and the cleaned text series
+        return mask, cleaned
+    
     def _clean_ad_lid_price(self, series: pd.Series) -> pd.Series:
         s = series.copy()
 
@@ -234,14 +241,21 @@ class ThreeWeekSummarizer:
 
         s_obj = s.astype("object")
 
-        # Use explicit-format parser (no inference -> no warning)
-        is_date_like = self._parse_dates_explicit(s_obj)
+        # Get BOTH: date-like mask and cleaned string values
+        is_date_like, cleaned_text = self._parse_dates_explicit(s_obj)
 
-        cleaned = s_obj.mask(is_date_like, other=np.nan)
-        cleaned = cleaned.replace("", np.nan)
+        # Apply: set date-like to NaN, keep cleaned string elsewhere
+        out = cleaned_text.mask(is_date_like, other=np.nan)
 
-        return cleaned
+        # Empty strings to NaN
+        out = out.replace("", np.nan)
 
+        # Optionally: convert to float numeric (uncomment if you want numeric result)
+        # This will turn valid cleaned prices like "23.22" -> 23.22 and leave NaN as NaN.
+        # out = pd.to_numeric(out, errors="coerce")
+
+        return out
+    
     def run(self, sundayweeknumber: int, horizon: int = 3) -> Dict[str, Dict[str, pd.DataFrame]]:
         """
         Returns: { folder_name : { file_name : DataFrame } }
@@ -344,17 +358,77 @@ class ThreeWeekSummarizer:
                     ad_only = combined.loc[mask].copy()
                     ad_only[ad_lid_price_col] = cleaned.loc[mask]
 
-                    # ---------------------------- NEW: sort AdLidPriceOnly by Item numerically ----------------------------
-                    if "Item" in ad_only.columns:
-                        ad_only = ad_only.sort_values(
-                            by="Item",
-                            key=lambda s: pd.to_numeric(
-                                s.astype(str).str.strip().str.replace(r"[^0-9.\-]", "", regex=True),
-                                errors="coerce"
-                            ),
-                            ascending=True,
-                            na_position="last"
-                        ).reset_index(drop=True)
+                # ---------------------------- NEW: Phased stable sort for AdLidPriceOnly ----------------------------
+                # Phase 1: Sort by numeric Item ASC to make groups deterministic and contiguous
+                if "Item" in ad_only.columns:
+                    _item_num = pd.to_numeric(
+                        ad_only["Item"].astype(str).str.strip().str.replace(r"[^0-9.\-]", "", regex=True),
+                        errors="coerce"
+                    )
+                    ad_only = (
+                        ad_only
+                        .assign(_item_num=_item_num)
+                        .sort_values(by="_item_num", ascending=True, na_position="last", kind="mergesort")
+                    )
+
+                    # Phase 2: Stable sort by per-Item row count DESC
+                    # (keeps the numeric Item order within ties because mergesort is stable)
+                    _item_count = ad_only.groupby("Item")["Item"].transform("size")
+                    ad_only = (
+                        ad_only
+                        .assign(_item_count=_item_count)
+                        .sort_values(by="_item_count", ascending=False, kind="mergesort")
+                        .drop(columns=["_item_num", "_item_count"])
+                        .reset_index(drop=True)
+                    )
+
+                    # Phase 2.5: Stable sort by earliest "Loading Start Date" per Item (ascending)
+                    # - Parses the date column to datetime (invalid -> NaT).
+                    # - Computes per-Item minimum start date.
+                    # - Sorts by that minimum; NaT goes last.
+                    if "Loading Start Date" in ad_only.columns:
+                        print("sorting Loading Start Date")
+                        _start_dt = pd.to_datetime(ad_only["Loading Start Date"], errors="coerce")
+                        _item_min_start = _start_dt.groupby(ad_only["Item"]).transform("min")
+                        ad_only = (
+                            ad_only
+                            .assign(_item_min_start=_item_min_start,
+                                    _min_isna=_item_min_start.isna())
+                            .sort_values(by=["_min_isna", "_item_min_start"],
+                                         ascending=[True, True],
+                                         kind="mergesort")
+                            .drop(columns=["_item_min_start", "_min_isna"])
+                            .reset_index(drop=True)
+                        )
+                    
+                    # Phase 3 - in-group ascending sort by Ad Lid Price
+                    # Preserve current Item order exactly as arranged by phases 1 & 2
+                    _item_order_map = {val: i for i, val in enumerate(ad_only["Item"].drop_duplicates())}
+                    _price_num = pd.to_numeric(ad_only[ad_lid_price_col], errors="coerce")
+
+                    # Parse row-level start date (not the per-Item min)
+                    _start_dt_row = pd.to_datetime(ad_only["Loading Start Date"], errors="coerce") \
+                        if "Loading Start Date" in ad_only.columns else pd.Series(pd.NaT, index=ad_only.index)
+
+                    # Sort within each Item (least -> greatest), keeping Item groups in the same order.
+                    # NaNs (missing/invalid prices) go to the bottom of each Item group.
+                    ad_only = (
+                        ad_only
+                        .assign(
+                            _item_order=ad_only["Item"].map(_item_order_map),
+                            _start_dt_row = _start_dt_row,
+                            _price_num=_price_num,
+                            _price_isna=_price_num.isna()
+                        )
+                        .sort_values(
+                            by=["_item_order", "_start_dt_row", "_price_isna", "_price_num"],
+                            ascending=[True, True, True, True],
+                            na_position="last",
+                            kind="mergesort",             # stable: preserves row order within ties
+                        )
+                        .drop(columns=["_item_order", "_start_dt_row", "_price_num", "_price_isna"])
+                        .reset_index(drop=True)
+                    )
                     # ------------------------------------------------------------------------------------------------------
 
                     # You could also keep the original in a separate column for comparison:
