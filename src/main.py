@@ -9,6 +9,14 @@ from modules.graph_client import GraphClient
 from modules.query import OneDriveFolderQuery, SQLServerQuery
 from modules.summarizer import ThreeWeekSummarizer
 
+import os
+from pathlib import Path
+import pandas as pd
+
+# Styling imports
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -19,13 +27,6 @@ logger = logging.getLogger("main")
 def generate_output_excel(tws, results):
     # Example: write each folder’s per-file DataFrames to disk (one Excel workbook per folder)
     # Each sheet is a file; DataFrame has a 'SourceFile' column for traceability.
-    import os
-    from pathlib import Path
-    import pandas as pd
-
-    # Styling imports
-    from openpyxl.styles import PatternFill
-    from openpyxl.utils import get_column_letter
 
     # Columns to drop from AdLidPriceOnly
     DROP_FROM_AD = ["Product Number", "Type", "Holiday Coloring Code", "Unnamed: 2", "Unnamed: 3"]
@@ -233,6 +234,19 @@ def main():
     out_dir = generate_output_excel(tws=tws, results=results_consolidated)
 
     logger.info("Summaries written to: %s", out_dir.resolve())
+
+    # Upload each generated .xlsx so that each file lives in a folder named after itself
+    cfg = Config()
+    gc = GraphClient(AuthProvider(cfg).acquire_token(), base=cfg.GRAPH_BASE)
+
+    for p in Path(out_dir).glob("*.xlsx"):
+        gc.upload_local_file_into_same_named_folder(
+            upn=cfg.OWNER_UPN,
+            local_relative_path=str(p),
+            base_folder_path=cfg.BASE_FOLDER_PATH,  # e.g., "Ad Lids"
+            folder_name_mode="file-name",           # per your instruction
+            conflict_behavior="replace"             # overwrite if the file already exists
+        )
 
 if __name__ == "__main__":
     main()
